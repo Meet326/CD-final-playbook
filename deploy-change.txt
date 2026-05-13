@@ -1,0 +1,177 @@
+---
+- name: Playbook for deploying and creating the site
+  hosts: windows
+  vars:
+    nexus_redirect_url: "http://103.214.226.42:8081/service/rest/v1/search/assets/download?sort=version&direction=desc&repository={{repo}}&group={{groupid}}&name={{artifactid}}"
+    download_dir: "{{downloadpath}}"
+    backup_path: "{{backuppath}}"
+    dest_path: "C:\\inetpub\\wwwroot\\{{ sitename }}"
+    site: "{{ sitename }}"
+
+  tasks:
+    - name: Get metadata
+      ansible.windows.win_uri:
+        url: "{{ nexus_redirect_url }}"
+        method: HEAD
+        follow_redirects: all
+        status_code: 200
+      register: nexus_head
+
+    - name: Extract the actual filename
+      set_fact:
+        artifact_name: "{{ nexus_head.response_uri | basename }}"
+
+    - name: download the file
+      ansible.windows.win_get_url:
+        url: "{{ nexus_redirect_url }}"
+        dest: "{{ download_dir }}\\{{ artifact_name }}"
+        follow_redirects: all
+        force: yes
+
+    - name: Check if IIS site exists
+      ansible.windows.win_shell: |
+        Import-Module WebAdministration
+        if (Get-Website -Name "{{ site }}" -ErrorAction SilentlyContinue) {
+            Write-Output "EXISTS"
+        } else {
+            Write-Output "NOT_FOUND"
+        }
+      register: site_check
+
+    # --- NEW SITE CREATION ---
+    - name: Creating directory if not exists
+      ansible.windows.win_file:
+        path: "{{ dest_path }}"
+        state: directory
+      when: site_check.stdout | trim == "NOT_FOUND"
+
+    - name: Unzipping artifact for new site
+      community.windows.win_unzip:
+        src: "{{ download_dir }}\\{{ artifact_name }}"
+        dest: "{{ dest_path }}"
+        recurse: no
+        delete_archive: true
+      when: site_check.stdout | trim == "NOT_FOUND"
+
+    - name: Create App Pool
+      community.windows.win_iis_webapppool:
+        name: "{{ site }}"
+        state: started
+      when: site_check.stdout | trim == "NOT_FOUND"
+
+    - name: Configure IIS Site
+      community.windows.win_iis_website:
+        name: "{{ site }}"
+        state: started
+        port: "{{ port }}"
+        ip: "*"
+        application_pool: "{{ site }}"
+        physical_path: "{{ dest_path }}"
+      when: site_check.stdout | trim == "NOT_FOUND"
+
+    # --- REDEPLOYMENT LOGIC (If site exists) ---
+ #   - block:
+    # --- REDEPLOYMENT LOGIC (If site exists) ---
+    - name: Stop site
+      community.windows.win_iis_website:
+        name: "{{ site }}"
+        state: stopped
+      when: site_check.stdout | trim == "EXISTS"
+
+    - name: Stop App Pool
+      community.windows.win_iis_webapppool:
+        name: "{{ site }}"
+        state: stopped
+      when: site_check.stdout | trim == "EXISTS"
+
+    - name: Create backup directory 
+      ansible.windows.win_file:
+        path: "{{ backup_path }}\\{{ site }}"
+        state: directory
+      when: site_check.stdout | trim == "EXISTS"
+
+    - name: Copy ALL files to backup
+      ansible.windows.win_copy:
+        src: "{{ dest_path }}\\"
+        dest: "{{ backup_path }}\\{{ site }}"
+        remote_src: yes
+      when: site_check.stdout | trim == "EXISTS"
+
+    - name: Clean destination folder (Total Wipe)
+      ansible.windows.win_shell: Remove-Item -Path "{{ dest_path }}\*" -Recurse -Force
+      when: site_check.stdout | trim == "EXISTS"
+
+    - name: Unzip new artifact
+      community.windows.win_unzip:
+        src: "{{ download_dir }}\\{{ artifact_name }}"
+        dest: "{{ dest_path }}"
+        recurse: no
+      when: site_check.stdout | trim == "EXISTS"
+
+    - name: Restore Configs (Simple Method)
+      ansible.windows.win_copy:
+        src: "{{ backup_path }}\\{{ site }}\\web.config"
+        dest: "{{ dest_path }}\\web.config"
+        remote_src: yes
+      ignore_errors: yes
+      when: site_check.stdout | trim == "EXISTS"
+      
+    - name: Restore Settings (Simple Method)
+      ansible.windows.win_copy:
+        src: "{{ backup_path }}\\{{ site }}\\appsettings.json"
+        dest: "{{ dest_path }}\\appsettings.json"
+        remote_src: yes
+      ignore_errors: yes
+      when: site_check.stdout | trim == "EXISTS"
+      
+    - name: Restore Logs Folder (Simple Method)
+      ansible.windows.win_copy:
+        src: "{{ backup_path }}\\{{ site }}\\logs\\"
+        dest: "{{ dest_path }}\\logs\\"
+        remote_src: yes
+      ignore_errors: yes
+      when: site_check.stdout | trim == "EXISTS"      
+      
+    - name: Starting pool and site
+      community.windows.win_iis_webapppool:
+        name: "{{ site }}"
+        state: started
+
+    - name: Starting site
+      community.windows.win_iis_website:
+        name: "{{ site }}"
+        state: started
+
+    - name: Checking the health
+      ansible.windows.win_uri:
+        url: "http://192.168.0.42:{{ port }}"
+      register: health_check
+      failed_when: health_check.status_code == 500
+
+    #  rescue:
+       # - name: ROLLBACK - Stop site
+        #  community.windows.win_iis_website:
+         #   name: "{{ site }}"
+        #    state: stopped
+
+       # - name: ROLLBACK - Stop App Pool
+       #   community.windows.win_iis_webapppool:
+        #    name: "{{ site }}"
+        #    state: stopped
+
+       # - name: ROLLBACK - Clean failed deployment
+       #   ansible.windows.win_shell: Remove-Item -Path "{{ dest_path }}\*" -Exclude "appsetting.json", "logs", "web.config" -Recurse -Force
+
+       # - name: ROLLBACK - Restore files from Backup
+       #   ansible.windows.win_copy:
+        #    src: "{{ backup_path }}\\{{ site }}\\"
+        #    dest: "{{ dest_path }}"
+         #   remote_src: yes
+
+       # - name: ROLLBACK - Restart site
+       #   community.windows.win_iis_website:
+        #    name: "{{ site }}"
+         #   state: started
+
+
+
